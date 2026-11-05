@@ -35,6 +35,8 @@ py -3.13 -m PyInstaller --noconfirm --clean VRM2PMX-CLI.spec
 
 生成的程序位于 `dist/`。v1.4.2 发布包使用 Python 3.13.17、NumPy 2.5.4、Pillow 13.0.0、pypinyin 0.55.0、tkinterdnd2 0.7.0 和 PyInstaller 6.22.3 构建。
 
+图标原始文件为 `assets/VRM2PMX.svg`，可运行 `py -3.13 dev/make_icon.py` 重新生成 PNG 和 ICO。
+
 ## 许可证
 
 Copyright (c) 2026 CoryDawn。项目代码采用 [GNU GPL v3.0](LICENSE)（GPL-3.0-only）许可证。
