@@ -20,16 +20,16 @@
 
 ## 软件界面
 
-![深色主题下的模型列表和转换设置](docs/images/interface-dark.jpg)
+![深色主题下的模型列表和转换设置](docs/images/interface-dark.png)
 
 <details>
 <summary>查看浅色界面</summary>
 
-![浅色主题下的模型列表和转换设置](docs/images/interface-light.jpg)
+![浅色主题下的模型列表和转换设置](docs/images/interface-light.png)
 
 </details>
 
-界面截图中的模型名称和作者为演示数据，画面为旧版界面示意，实际设置以当前版本为准。
+界面截图中的模型名称和作者为演示数据。
 
 ## 下载和使用
 
