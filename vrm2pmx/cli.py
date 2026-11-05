@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
@@ -22,7 +23,12 @@ def main(argv=None):
     ap.add_argument("--softness", type=float, default=0.75,
                     help="通用版柔软度，默认 0.75；调小更硬、回落更快，建议 0.55–1.0")
     ap.add_argument("--jp-names", action="store_true", help="把材质/形态键名称里的中文换成日文字形")
+    ap.add_argument("--adjustment-bones", action="store_true", help="生成动作修正用调整骨（默认位于模型左侧）")
+    ap.add_argument("--adjustment-offset", type=float, nargs=3, metavar=("X", "Y", "Z"),
+                    default=(-20.0, 0.0, 0.0), help="调整骨位置偏移，默认 -20 0 0")
     args = ap.parse_args(argv)
+    if not all(math.isfinite(value) for value in args.adjustment_offset):
+        ap.error("调整骨位置必须为有限数值")
 
     ok = 0
     for path in args.inputs:
@@ -35,6 +41,8 @@ def main(argv=None):
             physics_softness=args.softness,
             physics_preset=args.preset,
             localize_names=args.jp_names,
+            adjustment_bones=args.adjustment_bones,
+            adjustment_offset=tuple(args.adjustment_offset),
             out_dir=args.out,
         )
         rep = Converter(opt).convert(path)

@@ -15,6 +15,7 @@ app theme and re-checks it every few seconds.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import subprocess
@@ -61,6 +62,10 @@ DEFAULTS = {
     "preset": "universal",       # universal / final
     "softness": 0.75,
     "jp_names": False,
+    "adjustment_bones": False,
+    "adjustment_x": -20.0,
+    "adjustment_y": 0.0,
+    "adjustment_z": 0.0,
     "theme": "system",           # system / light / dark
 }
 
@@ -69,6 +74,100 @@ PRESET_HELP = {
     "final": "按骨骼名称分类的旧方案，仅供对比",
 }
 STATUS_TEXT = {"wait": "待转换", "run": "转换中", "ok": "完成", "fail": "失败", "skip": "已跳过"}
+
+
+def _auto_scrollbar(scrollbar, viewport, **packing):
+    """Hide an unnecessary scrollbar and restore it before its viewport."""
+    def update(first, last):
+        scrollbar.set(first, last)
+        visible = float(first) > 0.0 or float(last) < 1.0
+        if visible and not scrollbar.winfo_manager():
+            scrollbar.pack(before=viewport, **packing)
+        elif not visible and scrollbar.winfo_manager():
+            scrollbar.pack_forget()
+    return update
+
+
+class _SmoothScroll:
+    """Ease wheel scrolling while leaving scrollbar dragging direct."""
+
+    def __init__(self, viewport, fraction_per_notch):
+        self.viewport = viewport
+        self.fraction_per_notch = fraction_per_notch
+        self.motion = W._Animation(viewport, viewport.yview()[0], self._apply)
+
+    def _apply(self):
+        self.viewport.yview_moveto(self.motion.value)
+
+    def wheel(self, event):
+        first, last = self.viewport.yview()
+        if last - first >= 1.0:
+            return "break"
+        if getattr(event, "num", None) in (4, 5):
+            amount = -1.0 if event.num == 4 else 1.0
+        else:
+            amount = -float(getattr(event, "delta", 0)) / 120.0
+        if not amount:
+            return "break"
+        if self.motion.job is None:
+            self.motion.value = self.motion.target = first
+        step = self.fraction_per_notch(first, last)
+        target = min(max(self.motion.target + amount * step, 0.0), max(0.0, 1.0 - (last - first)))
+        self.motion.to(target, duration=180)
+        return "break"
+
+    def scrollbar(self, *args):
+        self.motion._cancel()
+        self.viewport.yview(*args)
+        self.motion.value = self.motion.target = self.viewport.yview()[0]
+
+
+class _BottomFade:
+    """A click-through Windows alpha overlay showing more content below."""
+
+    def __init__(self, parent, viewport, color):
+        self.viewport = viewport
+        self.strips = []
+        self.visible = False
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
+            user32.GetWindowLongW.restype = ctypes.c_long
+            user32.SetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_long)
+            user32.SetWindowLongW.restype = ctypes.c_long
+            user32.SetLayeredWindowAttributes.argtypes = (wintypes.HWND, wintypes.DWORD,
+                                                           wintypes.BYTE, wintypes.DWORD)
+            user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+            for i in range(12):
+                strip = tk.Frame(parent, background=color, borderwidth=0, highlightthickness=0)
+                hwnd = strip.winfo_id()
+                style = user32.GetWindowLongW(hwnd, -20)
+                user32.SetWindowLongW(hwnd, -20, style | 0x00080000 | 0x00000020)
+                alpha = int(215 * ((i + 1) / 12) ** 1.7)
+                if not user32.SetLayeredWindowAttributes(hwnd, 0, alpha, 0x2):
+                    strip.destroy()
+                    raise OSError("layered window setup failed")
+                self.strips.append(strip)
+        except (AttributeError, OSError, tk.TclError):
+            for strip in self.strips:
+                strip.destroy()
+            self.strips.clear()
+
+    def show(self, visible):
+        visible = bool(visible and self.strips)
+        if visible == self.visible:
+            return
+        self.visible = visible
+        for i, strip in enumerate(self.strips):
+            if visible:
+                strip.place(in_=self.viewport, relx=0, rely=1, relwidth=1, y=-24 + i * 2, height=2)
+                strip.lift()
+            else:
+                strip.place_forget()
 
 
 def _asset_path(*parts: str) -> str:
@@ -219,6 +318,10 @@ class App(_TkBase):
         self.preset = tk.StringVar(value=s["preset"] if s["preset"] in PRESET_HELP else "universal")
         self.softness = tk.DoubleVar(value=s["softness"])
         self.jp_names = tk.BooleanVar(value=s["jp_names"])
+        self.adjustment_bones = tk.BooleanVar(value=s["adjustment_bones"])
+        self.adjustment_x = tk.DoubleVar(value=s["adjustment_x"])
+        self.adjustment_y = tk.DoubleVar(value=s["adjustment_y"])
+        self.adjustment_z = tk.DoubleVar(value=s["adjustment_z"])
         self.theme = tk.StringVar(value=s["theme"] if s["theme"] in ("system", "light", "dark") else "system")
         self._mode = ""                       # palette in use: light / dark
         self._progress_val = 0.0
@@ -229,10 +332,12 @@ class App(_TkBase):
         self._q: queue.Queue = queue.Queue()
 
         self._fonts()
-        for var in (self.out_mode, self.physics, self.preset):
+        for var in (self.out_mode, self.physics, self.preset, self.adjustment_bones):
             var.trace_add("write", lambda *_: self._sync())
         self.softness.trace_add("write", lambda *_: self._value_labels())
         self.pose.trace_add("write", lambda *_: self._value_labels())
+        for var in (self.adjustment_x, self.adjustment_y, self.adjustment_z):
+            var.trace_add("write", lambda *_: self._value_labels())
         self.theme.trace_add("write", lambda *_: self.apply_theme())
         self.apply_theme()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -415,9 +520,14 @@ class App(_TkBase):
         self.tree.tag_configure("run", foreground=ACCENT)
         self.tree.tag_configure("wait", foreground=TEXT)
         self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview, style="Flat.Vertical.TScrollbar")
-        sb.pack(side="right", fill="y")
-        self.tree.configure(yscrollcommand=sb.set)
+        self.model_scroll_motion = _SmoothScroll(self.tree, lambda _first, _last:
+                                                3.0 / max(1, len(self.tree.get_children())))
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.tree.bind(sequence, self.model_scroll_motion.wheel)
+        self.model_scrollbar = ttk.Scrollbar(holder, orient="vertical", command=self.model_scroll_motion.scrollbar,
+                                             style="Flat.Vertical.TScrollbar")
+        self.tree.configure(yscrollcommand=_auto_scrollbar(self.model_scrollbar, self.tree,
+                                                          side="right", fill="y"))
         self.tree.bind("<Double-1>", self._on_double)
         self.tree.bind("<Delete>", lambda _e: self.remove_selected())
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._show_path())
@@ -441,12 +551,30 @@ class App(_TkBase):
 
     def _build_settings(self, parent):
         container = self._card(parent, fill="both", expand=True)
-        self.settings_scroll = tk.Canvas(container, background=CARD, highlightthickness=0, borderwidth=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.settings_scroll.yview,
-                                  style="Flat.Vertical.TScrollbar")
-        scrollbar.pack(side="right", fill="y", padx=(10, 0))
+        foot = tk.Frame(container, background=CARD)
+        foot.pack(side="bottom", fill="x", pady=(8, 0))
+        tk.Frame(foot, background=LINE, height=1).pack(fill="x")
+        self.reset_all_button = RoundButton(foot, "↺  恢复默认", self.reset_settings, kind="link",
+                                            font=self.f_small, padx=0, pady=5, bg=CARD)
+        self.reset_all_button.pack(side="right")
+        Tooltip(self.reset_all_button, "恢复所有设置的默认值（主题除外）")
+
+        viewport_row = tk.Frame(container, background=CARD)
+        viewport_row.pack(side="top", fill="both", expand=True)
+        self.settings_scroll = tk.Canvas(viewport_row, background=CARD, highlightthickness=0, borderwidth=0)
+        self.settings_scroll_motion = _SmoothScroll(self.settings_scroll, lambda first, last: 0.3 * (last - first))
+        self.settings_scrollbar = ttk.Scrollbar(viewport_row, orient="vertical", command=self.settings_scroll_motion.scrollbar,
+                                               style="Flat.Vertical.TScrollbar")
         self.settings_scroll.pack(side="left", fill="both", expand=True)
-        self.settings_scroll.configure(yscrollcommand=scrollbar.set)
+        auto_scroll = _auto_scrollbar(self.settings_scrollbar, self.settings_scroll,
+                                      side="right", fill="y", padx=(10, 0))
+        self.settings_fade = _BottomFade(viewport_row, self.settings_scroll, CARD)
+
+        def update_scrollbar(first, last):
+            auto_scroll(first, last)
+            self.settings_fade.show(float(last) < 1.0)
+
+        self.settings_scroll.configure(yscrollcommand=update_scrollbar)
         card = tk.Frame(self.settings_scroll, background=CARD)
         window = self.settings_scroll.create_window(0, 0, window=card, anchor="nw")
 
@@ -495,6 +623,34 @@ class App(_TkBase):
         self.pose_slider.pack(fill="x", pady=(4, 0))
         Tooltip(self.pose_slider, "VRM 是 T-pose（手臂平举），MMD 动作假设手臂下垂。默认 30°；0° 保持原姿势。")
 
+        tg_adjust = Toggle(card, self.adjustment_bones, "生成动作调整骨", font=self.f_base, bg=CARD)
+        tg_adjust.pack(anchor="w", pady=(12, 0))
+        Tooltip(tg_adjust, "生成调整骨，方便在 MMD 中手动修正动作和穿模；关闭足 IK 时也可调整腿部旋转。")
+
+        adjustment_heading = tk.Frame(card, background=CARD)
+        adjustment_heading.pack(fill="x", pady=(10, 2))
+        self._label(adjustment_heading, "调整骨生成位置", "muted").pack(side="left")
+        self.adjustment_reset = RoundButton(adjustment_heading, "↺", self.reset_adjustment_position,
+                                            kind="link", font=("Segoe UI Symbol", 13), padx=4, pady=0,
+                                            width=28, bg=CARD)
+        self.adjustment_reset.pack(side="left", padx=(4, 0))
+        Tooltip(self.adjustment_reset, "恢复调整骨位置默认值（X −20，Y 0，Z 0）")
+        self.adjustment_sliders, self.adjustment_values, self.adjustment_titles = [], [], []
+        for axis, var in (("X", self.adjustment_x), ("Y", self.adjustment_y), ("Z", self.adjustment_z)):
+            row = tk.Frame(card, background=CARD)
+            row.pack(fill="x", pady=(2, 0))
+            label = self._label(row, axis)
+            label.pack(side="left", padx=(0, 8))
+            value = self._label(row, "", "value", width=5)
+            value.configure(anchor="e")
+            value.pack(side="right", padx=(6, 0))
+            slider = Slider(row, var, -100, 100, 1, bg=CARD)
+            slider.pack(side="left", fill="x", expand=True)
+            self.adjustment_titles.append(label)
+            self.adjustment_values.append(value)
+            self.adjustment_sliders.append(slider)
+            Tooltip(slider, f"调整骨整体沿 {axis} 轴偏移（PMX 单位），范围 -100 至 100。")
+
         # 物理
         self._section(card, "物理")
         Toggle(card, self.physics, "生成物理（刚体 + 关节）", font=self.f_base, bg=CARD).pack(anchor="w")
@@ -527,26 +683,13 @@ class App(_TkBase):
         tg.pack(anchor="w")
         Tooltip(tg, "防止 PMX Editor / MMD 显示乱码。会改写名称：旧 VMD 里指向中文表情名的轨道可能失效。")
 
-        foot = tk.Frame(card, background=CARD)
-        foot.pack(side="bottom", fill="x")
-        RoundButton(foot, "恢复默认", self.reset_settings, kind="link", font=self.f_small, padx=0, pady=2,
-                    bg=CARD).pack(side="right")
-
-        def scroll_settings(event):
-            if event.num in (4, 5):
-                direction = -1 if event.num == 4 else 1
-            else:
-                direction = -1 if event.delta > 0 else 1
-            self.settings_scroll.yview_scroll(direction * 3, "units")
-            return "break"
-
         def bind_wheel(widget):
             for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                widget.bind(sequence, scroll_settings, add="+")
+                widget.bind(sequence, self.settings_scroll_motion.wheel, add="+")
             for child in widget.winfo_children():
                 bind_wheel(child)
 
-        bind_wheel(container)
+        bind_wheel(viewport_row)
 
     def _build_log(self, parent):
         self.log_frame = RoundedBox(parent, radius=10, pad=(6, 6), bg=CARD)
@@ -577,12 +720,20 @@ class App(_TkBase):
         self.soft_title.configure(foreground=TEXT if soft_on else DISABLED)
         self.soft_val.configure(foreground=ACCENT if soft_on else DISABLED)
         self.preset_help.configure(text=PRESET_HELP[self.preset.get()] if phys else "不生成刚体和关节，头发等不会摆动。")
+        adjust_on = self.adjustment_bones.get() and not self._busy
+        self.adjustment_reset.configure_button(state="normal" if adjust_on else "disabled")
+        for slider, title, value in zip(self.adjustment_sliders, self.adjustment_titles, self.adjustment_values):
+            slider.set_enabled(adjust_on)
+            title.configure(foreground=TEXT if adjust_on else DISABLED)
+            value.configure(foreground=ACCENT if adjust_on else DISABLED)
 
     def _value_labels(self):
         try:
             self.soft_val.configure(text=f"{float(self.softness.get()):.2f}")
             v = float(self.pose.get())
             self.pose_val.configure(text=f"{v:.0f}°" + ("  T-pose" if v == 0 else ""))
+            for label, var in zip(self.adjustment_values, (self.adjustment_x, self.adjustment_y, self.adjustment_z)):
+                label.configure(text=f"{float(var.get()):.0f}")
         except (tk.TclError, ValueError):
             pass
 
@@ -607,6 +758,10 @@ class App(_TkBase):
             "scale": num(self.scale, DEFAULTS["scale"]), "pose": num(self.pose, DEFAULTS["pose"]),
             "physics": bool(self.physics.get()), "preset": self.preset.get(),
             "softness": num(self.softness, DEFAULTS["softness"]), "jp_names": bool(self.jp_names.get()),
+            "adjustment_bones": bool(self.adjustment_bones.get()),
+            "adjustment_x": num(self.adjustment_x, DEFAULTS["adjustment_x"]),
+            "adjustment_y": num(self.adjustment_y, DEFAULTS["adjustment_y"]),
+            "adjustment_z": num(self.adjustment_z, DEFAULTS["adjustment_z"]),
             "theme": self.theme.get(),
         }
 
@@ -615,7 +770,15 @@ class App(_TkBase):
         try:
             with open(_settings_path(), encoding="utf-8") as f:
                 data = json.load(f)
-            return {k: v for k, v in data.items() if k in DEFAULTS and isinstance(v, type(DEFAULTS[k]))}
+            settings = {k: v for k, v in data.items() if k in DEFAULTS and isinstance(v, type(DEFAULTS[k]))}
+            for axis in "xyz":
+                key = "adjustment_" + axis
+                value = data.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    settings[key] = max(-100.0, min(100.0, float(value)))
+                else:
+                    settings.pop(key, None)
+            return settings
         except Exception:  # noqa: BLE001
             return {}
 
@@ -631,8 +794,15 @@ class App(_TkBase):
     def reset_settings(self):
         for key, var in (("out_mode", self.out_mode), ("out_dir", self.out_dir), ("scale", self.scale),
                          ("pose", self.pose), ("physics", self.physics), ("preset", self.preset),
-                         ("softness", self.softness), ("jp_names", self.jp_names)):
+                         ("softness", self.softness), ("jp_names", self.jp_names),
+                         ("adjustment_bones", self.adjustment_bones),
+                         ("adjustment_x", self.adjustment_x), ("adjustment_y", self.adjustment_y),
+                         ("adjustment_z", self.adjustment_z)):
             var.set(DEFAULTS[key])
+
+    def reset_adjustment_position(self):
+        for axis in "xyz":
+            getattr(self, "adjustment_" + axis).set(DEFAULTS["adjustment_" + axis])
 
     def _on_close(self):
         if self._busy and not messagebox.askyesno(APP_TITLE, "正在转换，确定要退出吗？"):
@@ -927,6 +1097,9 @@ class App(_TkBase):
                     physics_softness=float(opts["softness"]),
                     physics_preset=opts["preset"],
                     localize_names=bool(opts["jp_names"]),
+                    adjustment_bones=bool(opts.get("adjustment_bones", False)),
+                    adjustment_offset=tuple(float(opts.get("adjustment_" + axis, DEFAULTS["adjustment_" + axis]))
+                                            for axis in ("x", "y", "z")),
                     model_name=model_name,
                     out_dir=out_dir,
                 )

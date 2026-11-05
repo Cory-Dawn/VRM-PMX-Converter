@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from tkinterdnd2 import COPY, REFUSE_DROP
 
-from dev.tests.test_widgets import destroy_app
+from dev.tests.test_widgets import destroy_app, wait_ms
 from vrm2pmx.gui import App
 from vrm2pmx.widgets import RoundButton
 
@@ -37,7 +37,7 @@ class GuiDropAndSkipTests(unittest.TestCase):
             canvas = app.settings_scroll
             self.assertLess(canvas.yview()[1], 1.0)
             app.soft_slider.event_generate("<MouseWheel>", delta=-120)
-            app.update()
+            wait_ms(app, 230)
             self.assertGreater(canvas.yview()[0], 0.0)
             canvas.yview_moveto(1.0)
             app.update()
@@ -47,7 +47,7 @@ class GuiDropAndSkipTests(unittest.TestCase):
             self.assertLessEqual(last_row.winfo_rooty() + last_row.winfo_height(),
                                  canvas.winfo_rooty() + canvas.winfo_height())
             app.soft_slider.event_generate("<MouseWheel>", delta=120)
-            app.update()
+            wait_ms(app, 230)
             self.assertLess(canvas.yview()[1], 1.0)
             app.toggle_log(True)
             app.update()
@@ -56,7 +56,7 @@ class GuiDropAndSkipTests(unittest.TestCase):
             app.update()
             self.assertEqual(canvas.yview()[0], 0.0)
             app.out_entry.entry.event_generate("<MouseWheel>", delta=-120)
-            app.update()
+            wait_ms(app, 230)
             self.assertGreater(canvas.yview()[0], 0.0)
             app.toggle_log(False)
 
@@ -65,10 +65,87 @@ class GuiDropAndSkipTests(unittest.TestCase):
         canvas = app.settings_scroll
         if canvas.winfo_height() >= app.soft_slider.master.winfo_reqheight():
             self.assertEqual(canvas.yview(), (0.0, 1.0))
+            self.assertFalse(app.settings_scrollbar.winfo_manager())
+            self.assertFalse(app.settings_fade.visible)
         else:
             canvas.yview_moveto(1.0)
             app.update()
             self.assertAlmostEqual(canvas.yview()[1], 1.0)
+
+    def test_scrollbars_hide_when_unnecessary_and_fade_tracks_bottom(self):
+        app = self.app
+        app.geometry("960x720-10000-10000")
+        app.deiconify()
+        app.update()
+        self.assertFalse(app.model_scrollbar.winfo_manager())
+        for i in range(80):
+            app.tree.insert("", "end", values=(str(i), "", "", ""))
+        app.update()
+        self.assertTrue(app.model_scrollbar.winfo_manager())
+        app.tree.delete(*app.tree.get_children())
+        app.update()
+        self.assertFalse(app.model_scrollbar.winfo_manager())
+        for theme in ("light", "dark"):
+            app.theme.set(theme)
+            app.update()
+            c = app.settings_scroll
+            self.assertTrue(app.settings_scrollbar.winfo_manager())
+            if app.settings_fade.strips:
+                self.assertTrue(app.settings_fade.visible)
+            c.yview_moveto(1.0)
+            app.update()
+            c.yview_moveto(1.0)
+            app.update()
+            self.assertAlmostEqual(c.yview()[1], 1.0)
+            self.assertFalse(app.settings_fade.visible)
+            c.yview_moveto(0.0)
+            app.update()
+            if app.settings_fade.strips:
+                self.assertTrue(app.settings_fade.visible)
+
+    def test_wheel_animation_retargets_and_scrollbar_stays_direct(self):
+        app = self.app
+        app.geometry("960x720-10000-10000")
+        app.deiconify()
+        app.update()
+        c = app.settings_scroll
+        motion = app.settings_scroll_motion.motion
+        app.soft_slider.event_generate("<MouseWheel>", delta=-120)
+        self.assertGreater(motion.target, 0)
+        self.assertIsNotNone(motion.job)
+        wait_ms(app, 45)
+        self.assertGreater(c.yview()[0], 0)
+        self.assertLess(motion.value, motion.target)
+        prior_target = motion.target
+        app.soft_slider.event_generate("<MouseWheel>", delta=-120)
+        self.assertGreater(motion.target, prior_target)
+        app.settings_scroll_motion.scrollbar("moveto", "0.0")
+        self.assertIsNone(motion.job)
+        self.assertAlmostEqual(c.yview()[0], 0.0)
+
+        for i in range(80):
+            app.tree.insert("", "end", values=(str(i), "", "", ""))
+        app.update()
+        app.tree.event_generate("<MouseWheel>", delta=-120)
+        self.assertIsNotNone(app.model_scroll_motion.motion.job)
+        wait_ms(app, 230)
+        self.assertGreater(app.tree.yview()[0], 0.0)
+
+    def test_reset_footer_stays_visible_while_scrolling(self):
+        app = self.app
+        app.geometry("960x720-10000-10000")
+        app.deiconify()
+        app.update()
+        c = app.settings_scroll
+        button = app.reset_all_button
+        start_y = button.winfo_rooty()
+        self.assertTrue(button.winfo_ismapped())
+        c.yview_moveto(1.0)
+        app.update()
+        self.assertEqual(button.winfo_rooty(), start_y)
+        app.scale.set(20)
+        button._click(SimpleNamespace(x=0, y=0))
+        self.assertEqual(app.scale.get(), 14)
 
     def test_scale_reset_and_drop_with_unicode_and_duplicate_paths(self):
         app = self.app
@@ -93,6 +170,20 @@ class GuiDropAndSkipTests(unittest.TestCase):
         app._busy = True
         self.assertEqual(app._drop_files(SimpleNamespace(data=data)), REFUSE_DROP)
         self.assertEqual(len(app.files), 2)
+
+    def test_selected_offsets_reach_converter(self):
+        app = self.app
+        app.adjustment_bones.set(True)
+        app.adjustment_x.set(7)
+        app.adjustment_y.set(-3)
+        app.adjustment_z.set(12)
+        opts = app._collect_settings()
+        with patch("vrm2pmx.gui.Converter") as converter:
+            converter.return_value.convert.return_value = SimpleNamespace(ok=False, errors=["test"])
+            app._run([(0, "example.vrm", "example", self.tmp.name)], opts)
+        actual = converter.call_args.args[0]
+        self.assertTrue(actual.adjustment_bones)
+        self.assertEqual(actual.adjustment_offset, (7, -3, 12))
 
     def test_skip_all_existing_and_convert_remaining(self):
         app = self.app

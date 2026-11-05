@@ -166,6 +166,38 @@ class WidgetTests(unittest.TestCase):
 
 
 class AppThemeTests(unittest.TestCase):
+    def test_adjustment_bones_setting_is_remembered_and_reset(self):
+        with tempfile.TemporaryDirectory() as settings_dir, patch.dict(os.environ, {"APPDATA": settings_dir}):
+            app = App()
+            try:
+                self.assertFalse(app.adjustment_bones.get())
+                self.assertEqual((app.adjustment_x.get(), app.adjustment_y.get(), app.adjustment_z.get()),
+                                 (-20, 0, 0))
+                self.assertTrue(all(not slider._enabled for slider in app.adjustment_sliders))
+                app.adjustment_bones.set(True)
+                self.assertTrue(all(slider._enabled for slider in app.adjustment_sliders))
+                app.adjustment_x.set(7)
+                app.adjustment_y.set(-3)
+                app.adjustment_z.set(12)
+                app.theme.set("dark" if app._mode == "light" else "light")
+                self.assertTrue(app._collect_settings()["adjustment_bones"])
+                self.assertEqual([app._collect_settings()["adjustment_" + axis] for axis in "xyz"], [7, -3, 12])
+                app._save_settings()
+                self.assertTrue(app._load_settings()["adjustment_bones"])
+                self.assertEqual([app._load_settings()["adjustment_" + axis] for axis in "xyz"], [7, -3, 12])
+                app.scale.set(20)
+                app.adjustment_reset._click(SimpleNamespace(x=0, y=0))
+                self.assertEqual((app.adjustment_x.get(), app.adjustment_y.get(), app.adjustment_z.get()),
+                                 (-20, 0, 0))
+                self.assertEqual(app.scale.get(), 20)
+                app.adjustment_x.set(7)
+                app.reset_settings()
+                self.assertFalse(app.adjustment_bones.get())
+                self.assertEqual((app.adjustment_x.get(), app.adjustment_y.get(), app.adjustment_z.get()),
+                                 (-20, 0, 0))
+            finally:
+                destroy_app(app)
+
     def test_theme_rebuild_and_font_scaling(self):
         with tempfile.TemporaryDirectory() as settings_dir, patch.dict(os.environ, {"APPDATA": settings_dir}):
             app = App()

@@ -12,7 +12,7 @@ from .material import MaterialConverter, sort_materials
 from .morph import MorphConverter, PANEL_NAMES
 from .pmx import PMXModel, PMXVertex, write_pmx
 from .pose import DEFAULT_ANGLE_DEG, PoseBaker
-from .skeleton import SkeletonBuilder
+from .skeleton import F_VISIBLE, SkeletonBuilder
 from .vrm import VRM
 
 DEFAULT_SCALE = 14.0
@@ -27,6 +27,8 @@ class ConvertOptions:
     physics_softness: float = 0.75   # universal preset: smaller = stiffer, less jitter (1.0 = v9 hardness)
     physics_preset: str = "universal"   # universal (default since 2026-11-02) / final / zero / ...
     localize_names: bool = False     # Chinese material/morph names -> Japanese glyphs
+    adjustment_bones: bool = False   # optional motion correction controls
+    adjustment_offset: tuple[float, float, float] = (-20.0, 0.0, 0.0)
     model_name: str = ""
     out_dir: str = ""
     overwrite: bool = True
@@ -86,6 +88,7 @@ class Converter:
             rep.warnings.append(f"已把手臂下摆 {self.opt.pose_angle_deg:.0f}°（A-pose）")
 
         skel = SkeletonBuilder(vrm, scale).build()
+        adjustment_names = skel.add_adjustment_bones(self.opt.adjustment_offset) if self.opt.adjustment_bones else []
         rep.warnings.extend(skel.warnings)
 
         model_name = (self.opt.model_name
@@ -171,7 +174,7 @@ class Converter:
         model.idx_rigid = _index_size(len(model.rigid_bodies) + 1)
 
         # ---- display frames
-        model.display_frames = self._display_frames(model)
+        model.display_frames = self._display_frames(model, adjustment_names)
 
         write_pmx(model, out_pmx)
 
@@ -223,6 +226,25 @@ class Converter:
     def _build_vertices(self, vrm, skel, scale: float):
         verts = []
         ok = []          # per vertex: 4 bone ids actually used
+        twist_chains = {}
+        for root, end, twist, helpers in skel.twist_chains:
+            root_i, end_i = skel.by_name[root], skel.by_name[end]
+            start = skel.bones[root_i].pos
+            direction = skel.bones[end_i].pos - start
+            twist_chains[root_i] = (start, direction, float(np.dot(direction, direction)),
+                                    [root_i, *(skel.by_name[n] for n in helpers), skel.by_name[twist]])
+        leg_maps = {}
+        foot_splits = {}
+        for upper, lower, foot, toe, upper_d, lower_d, foot_d, ex, toe_helper in skel.leg_weight_chains:
+            for source, target in ((upper, upper_d), (lower, lower_d), (foot, foot_d), (toe, toe_helper)):
+                if source and target:
+                    leg_maps[skel.by_name[source]] = skel.by_name[target]
+            start = skel.bones[skel.by_name[foot]].pos
+            # EX lies 2/3 of the way from ankle to the toe pivot.
+            direction = (skel.bones[skel.by_name[ex]].pos - start) * 1.5
+            length2 = float(np.dot(direction, direction))
+            if length2 > 1e-12:
+                foot_splits[skel.by_name[foot_d]] = (start, direction, length2, skel.by_name[ex])
         for mesh in vrm.meshes:
             n = mesh.count
             pos = mesh.positions * scale
@@ -246,6 +268,10 @@ class Converter:
                 pairs = pairs[:4]
                 total = sum(p[1] for p in pairs)
                 pairs = [(b, wt / total) for b, wt in pairs]
+                if twist_chains and any(b in twist_chains for b, _ in pairs):
+                    pairs = self._distribute_twist_weights(pos[i], pairs, twist_chains)
+                if leg_maps and any(b in leg_maps for b, _ in pairs):
+                    pairs = self._distribute_leg_weights(pos[i], pairs, leg_maps, foot_splits)
 
                 v = PMXVertex(
                     position=pos[i].copy(),
@@ -276,6 +302,88 @@ class Converter:
                 ok.append(True)
         return verts, ok
 
+    @staticmethod
+    def _distribute_leg_weights(position, pairs, mapping, foot_splits):
+        """Move existing leg influence to its equivalent D chain.
+
+        Smoothly share the forefoot's ankle influence with EX, never discarding
+        another source influence when PMX's four-bone limit is already full.
+        """
+        merged = {}
+        for bone, weight in pairs:
+            target = mapping.get(bone, bone)
+            merged[target] = merged.get(target, 0.0) + weight
+        groups = []
+        for bone, weight in merged.items():
+            if bone not in foot_splits:
+                groups.append([(bone, weight)])
+                continue
+            start, direction, length2, ex = foot_splits[bone]
+            t = float(np.clip((np.dot(position - start, direction) / length2 - 1 / 3) * 1.5, 0, 1))
+            t = t * t * (3 - 2 * t)
+            if t <= 1e-8:
+                groups.append([(bone, weight)])
+            elif t >= 1 - 1e-8:
+                groups.append([(ex, weight)])
+            else:
+                groups.append([(bone, weight * (1 - t)), (ex, weight * t)])
+        spare = max(0, 4 - len(groups))
+        splits = sorted((i for i, group in enumerate(groups) if len(group) == 2),
+                        key=lambda i: min(groups[i][0][1], groups[i][1][1]), reverse=True)
+        keep = set(splits[:spare])
+        final = {}
+        for i, group in enumerate(groups):
+            if len(group) == 2 and i not in keep:
+                group = [(max(group, key=lambda item: item[1])[0], sum(w for _, w in group))]
+            for bone, weight in group:
+                final[bone] = final.get(bone, 0.0) + weight
+        return sorted(final.items(), key=lambda item: -item[1])
+
+    @staticmethod
+    def _distribute_twist_weights(position, pairs, chains):
+        """Split only existing arm influence; preserve unrelated weights and PMX's 4-bone limit.
+
+        A twist control contributes its full rotation; its three siblings receive
+        1/4, 1/2 and 3/4. Linear interpolation between adjacent influences gives
+        a smooth ramp. If no extra slot exists, use the nearer of those two
+        bones instead of dropping another original influence.
+        """
+        merged = {}
+        for bone, weight in pairs:
+            merged[bone] = merged.get(bone, 0.0) + weight
+        groups = []
+        for bone, weight in merged.items():
+            if bone not in chains:
+                groups.append([(bone, weight)])
+                continue
+            start, direction, length2, indices = chains[bone]
+            t = float(np.clip(np.dot(position - start, direction) / length2, 0.0, 1.0)) * 4.0
+            lower = min(int(t), 3)
+            fraction = t - lower
+            if fraction <= 1e-8:
+                groups.append([(indices[lower], weight)])
+            elif fraction >= 1.0 - 1e-8:
+                groups.append([(indices[lower + 1], weight)])
+            else:
+                groups.append([(indices[lower], weight * (1.0 - fraction)),
+                               (indices[lower + 1], weight * fraction)])
+        spare = max(0, 4 - len(groups))
+        split_order = sorted((i for i, group in enumerate(groups) if len(group) == 2),
+                             key=lambda i: min(groups[i][0][1], groups[i][1][1]), reverse=True)
+        keep_split = set(split_order[:spare])
+        result = []
+        for i, group in enumerate(groups):
+            if len(group) == 2 and i not in keep_split:
+                dominant = max(group, key=lambda item: item[1])[0]
+                result.append((dominant, sum(weight for _, weight in group)))
+            else:
+                result.extend(group)
+        # Adjacent groups can target the same bone at a joint.
+        final = {}
+        for bone, weight in result:
+            final[bone] = final.get(bone, 0.0) + weight
+        return sorted(final.items(), key=lambda item: -item[1])
+
     def _build_faces(self, vrm, vmap_ok, mat_order, n_materials):
         """Collect triangles grouped by material.
 
@@ -302,9 +410,8 @@ class Converter:
             faces.extend(lst)
         return np.array(faces, dtype=np.int32), counts
 
-    def _display_frames(self, model):
-        """MMD-style bone panel: Root (全ての親), 表情, センター, 体(上), 腕, 指,
-        体(下), 足, then every other bone in その他 (each bone listed once)."""
+    def _display_frames(self, model, adjustment_names=()):
+        """Group visible controls once; retain hidden deformation helpers outside the panel."""
         by = {b.name: i for i, b in enumerate(model.bones)}
         used: set[int] = set()
 
@@ -320,18 +427,23 @@ class Converter:
         sides = ("左", "右")
         fingers = [s + f + d for s in sides for f in ("親指", "人指", "中指", "薬指", "小指") for d in "０１２３"]
         frames = [
-            {"name": "Root", "name_en": "Root", "special": 1, "items": pick(["全ての親"]) or [(0, 0)]},
+            {"name": "Root", "name_en": "Root", "special": 1, "items": pick(["操作中心", "全ての親"]) or [(0, 0)]},
             {"name": "表情", "name_en": "Exp", "special": 1, "items": [(1, i) for i in range(len(model.morphs))]},
-            {"name": "センター", "name_en": "Center", "special": 0, "items": pick(["センター", "グルーブ"])},
+            {"name": "センター", "name_en": "Center", "special": 0, "items": pick(["センター", "グルーブ", "腰"])},
+            {"name": "IK", "name_en": "IK", "special": 0,
+             "items": pick([s + n for s in sides for n in ("足IK親", "足ＩＫ", "つま先ＩＫ")])},
             {"name": "体(上)", "name_en": "Body[u]", "special": 0,
-             "items": pick(["腰", "上半身", "上半身2", "上半身3", "首", "頭", "両目", "左目", "右目"])},
+             "items": pick(["上半身", "上半身2", "上半身3", "首", "頭", "両目", "左目", "右目"])},
             {"name": "腕", "name_en": "Arms", "special": 0,
-             "items": pick([s + n for s in sides for n in ("肩P", "肩", "腕", "腕捩", "ひじ", "手捩", "手首")])},
+             "items": pick([s + n for s in sides for n in ("肩P", "肩", "腕", "腕捩", "ひじ", "手捩", "手首", "ダミー")])},
             {"name": "指", "name_en": "Fingers", "special": 0, "items": pick(fingers)},
             {"name": "体(下)", "name_en": "Body[l]", "special": 0, "items": pick(["下半身"])},
             {"name": "足", "name_en": "Legs", "special": 0,
-             "items": pick([s + n for s in sides for n in ("足IK親", "足ＩＫ", "つま先ＩＫ", "足", "ひざ", "足首", "つま先")])},
+             "items": pick([s + n for s in sides for n in ("足", "ひざ", "足首", "つま先", "足D", "ひざD", "足首D", "足先EX")])},
         ]
+        if adjustment_names:
+            frames.append({"name": "_調整ボーン", "name_en": "Adjustment", "special": 0,
+                           "items": pick(adjustment_names)})
         frames.append({"name": "その他", "name_en": "Others", "special": 0,
-                       "items": [(0, i) for i in range(len(model.bones)) if i not in used]})
+                       "items": [(0, i) for i, b in enumerate(model.bones) if i not in used and b.flags & F_VISIBLE]})
         return frames

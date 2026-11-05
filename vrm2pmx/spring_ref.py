@@ -4,7 +4,7 @@
 Runs the VRM spring bones on a rigid whole-model test motion (still -> fast
 turn -> hold -> turn back -> smooth sway -> still) and reports where each PMX
 rigid body would be.  Used by the universal physics preset to give every chain
-the amount of sway it has in VRM, and by dev/physbench for comparisons.
+the amount of sway it has in VRM, and for offline comparisons.
 """
 from __future__ import annotations
 

@@ -165,6 +165,12 @@ class SkeletonBuilder:
         self.by_name: dict[str, int] = {}
         self.node_to_bone: dict[int, int] = {}
         self.warnings: list[str] = []
+        # Names survive the final index reorder; used to distribute skin weights.
+        self.twist_chains: list[tuple[str, str, str, tuple[str, ...]]] = []
+        # Names are resolved after reordering and optional adjustment controls.
+        self.leg_weight_chains: list[tuple[str, ...]] = []
+        self.adjustment_pairs: list[tuple[str, str]] = []
+        self.adjustment_offset = np.zeros(3)
 
     # ------------------------------------------------------------------ build
     def build(self) -> "SkeletonBuilder":
@@ -266,6 +272,20 @@ class SkeletonBuilder:
         # ---- 8. tail offsets (cosmetic, keeps PMX viewer happy)
         self._fill_tails()
 
+        # Both-eyes control is displayed above the head and points forward
+        # (MMD front is negative Z); it is not a child of either eye.
+        if "両目" in self.by_name:
+            self.bones[self.by_name["両目"]].tail_offset = np.array([0.0, 0.0, -0.04 * S])
+
+        # Match the conventional PMX display: the arm points to its joint,
+        # while twist controls have a zero display offset and a fixed axis.
+        for root, end, twist, helpers in self.twist_chains:
+            root_bone = self.bones[self.by_name[root]]
+            root_bone.flags |= F_TAIL_INDEX
+            root_bone.tail_bone = self.by_name[end]
+            for name in (twist, *helpers):
+                self.bones[self.by_name[name]].tail_offset = np.zeros(3)
+
         # ---- 9. MMD evaluates bone deformation in *index* order, so a child
         # sitting before its parent gets computed with a stale parent transform
         # and the mesh collapses. Sorting by depth (and keeping standard bones
@@ -292,6 +312,10 @@ class SkeletonBuilder:
             depth.append(d)
         kind_rank = {"std": 0, "vrm": 1, "helper": 2}
         order = sorted(range(n), key=lambda i: (depth[i], kind_rank.get(self.bones[i].kind, 3), i))
+        self._apply_order(order)
+
+    def _apply_order(self, order):
+        """Apply an index permutation and remap all skeleton references."""
         old2new = {old: new for new, old in enumerate(order)}
         self.bones = [self.bones[i] for i in order]
         for b in self.bones:
@@ -307,6 +331,107 @@ class SkeletonBuilder:
                 b.tail_bone = old2new.get(b.tail_bone, b.tail_bone)
         self.node_to_bone = {node: old2new[idx] for node, idx in self.node_to_bone.items()}
         self.by_name = {b.name: i for i, b in enumerate(self.bones)}
+
+    def add_adjustment_bones(self, offset=(-20.0, 0.0, 0.0)):
+        """Add an offset control rig and let selected MMD bones inherit from it."""
+        offset = np.asarray(offset, dtype=np.float64)
+        if offset.shape != (3,) or not np.all(np.isfinite(offset)):
+            raise ValueError("调整骨位置必须是三个有限数值")
+        names = ("センター", "グルーブ", "左足ＩＫ", "右足ＩＫ", "左つま先ＩＫ", "右つま先ＩＫ",
+                 "下半身", "上半身", "上半身2", "首", "左肩", "右肩", "頭", "両目",
+                 "左腕", "右腕", "左腕捩", "右腕捩", "左ひじ", "右ひじ", "左手捩", "右手捩",
+                 "左手首", "右手首", "左足", "右足", "左ひざ", "右ひざ", "左足首", "右足首")
+        master = self.by_name.get("全ての親")
+        if master is None or "調整ボーン親" in self.by_name:
+            self.warnings.append("无法创建调整骨：缺少全ての親或存在同名调整骨")
+            return []
+        eligible = []
+        for name in names:
+            i = self.by_name.get(name)
+            if i is None:
+                continue
+            bone = self.bones[i]
+            if name + "調整" in self.by_name or bone.flags & (F_ROT_ADD | F_MOVE_ADD):
+                self.warnings.append(f"{name} 已有同名调整骨或附加变换，已跳过")
+                continue
+            eligible.append(i)
+        d_indices = set()
+        for chain in self.leg_weight_chains:
+            for name in chain[4:7]:
+                i = self.by_name[name]
+                if name + "調整" in self.by_name or name + "調整付与" in self.by_name:
+                    self.warnings.append(f"{name} 已有同名调整骨或辅助骨，已跳过")
+                    continue
+                eligible.append(i)
+                d_indices.add(i)
+        if not eligible:
+            self.warnings.append("没有可添加调整骨的目标骨骼")
+            return []
+
+        old_count = len(self.bones)
+        self.adjustment_offset = offset.copy()
+        root = self._add("調整ボーン親", self.bones[master].pos + offset, master, kind="helper",
+                         flags=F_ROT | F_MOVE | F_VISIBLE | F_ENABLED)
+        self.adjustment_pairs.append((self.bones[master].name, "調整ボーン親"))
+        adjustment_for = {}
+        drivers = {}
+        created_names = ["調整ボーン親"]
+        # Original bones are already in parent-before-child order.
+        for i in sorted(eligible):
+            original = self.bones[i]
+            parent = original.parent
+            visited = set()
+            while parent >= 0 and parent not in adjustment_for and parent not in visited:
+                visited.add(parent)
+                parent = self.bones[parent].parent
+            adjust_parent = adjustment_for.get(parent, root)
+            flags = original.flags & (F_ROT | F_MOVE | F_AXIS)
+            flags |= F_VISIBLE | F_ENABLED
+            name = original.name + "調整"
+            created_names.append(name)
+            self.adjustment_pairs.append((original.name, name))
+            adjustment_for[i] = self._add(name, original.pos + offset, adjust_parent,
+                                          kind="helper", flags=flags, layer=original.layer,
+                                          fixed_axis=original.fixed_axis.copy(),
+                                          tail_offset=original.tail_offset.copy())
+            if i in d_indices:
+                # D already inherits the real joint. A same-pivot intermediary
+                # adds the adjustment without replacing that existing grant.
+                driver = self._add(original.name + "調整付与", original.pos, original.parent,
+                                   kind="helper", layer=original.layer,
+                                   flags=F_ROT | F_ENABLED | F_ROT_ADD,
+                                   inherit_parent=adjustment_for[i], inherit_weight=1.0)
+                drivers[i] = driver
+                original.parent = driver
+                continue
+            if original.flags & F_ROT:
+                original.flags |= F_ROT_ADD
+            if original.flags & F_MOVE:
+                original.flags |= F_MOVE_ADD
+            original.inherit_parent = adjustment_for[i]
+            original.inherit_weight = 1.0
+
+        for i, adjust_i in adjustment_for.items():
+            original, adjust = self.bones[i], self.bones[adjust_i]
+            if original.flags & F_TAIL_INDEX:
+                if original.tail_bone in adjustment_for:
+                    adjust.flags |= F_TAIL_INDEX
+                    adjust.tail_bone = adjustment_for[original.tail_bone]
+                elif 0 <= original.tail_bone < old_count:
+                    adjust.tail_offset = self.bones[original.tail_bone].pos - original.pos
+
+        # All controls must be evaluated before the bones inheriting from them.
+        # The original master is already before every selected target.
+        driver_set = set(drivers.values())
+        controls = [i for i in range(old_count, len(self.bones)) if i not in driver_set]
+        original_order = []
+        for i in range(master + 1, old_count):
+            if i in drivers:
+                original_order.append(drivers[i])
+            original_order.append(i)
+        order = list(range(master + 1)) + controls + original_order
+        self._apply_order(order)
+        return created_names
 
     # ------------------------------------------------------------------ utils
     def _add(self, name: str, pos, parent: int, kind: str = "std",
@@ -429,33 +554,45 @@ class SkeletonBuilder:
                                   upper3 if upper3 >= 0 else self.by_name["上半身"], kind="helper")
                 self.bones[sh_i].parent = shp_i
                 shc_i = self._add(side("肩C", is_left), p_ua.copy(), sh_i, kind="helper",
-                                  flags=F_ROT | F_VISIBLE | F_ENABLED | F_ROT_ADD,
+                                  flags=F_ROT | F_ENABLED | F_ROT_ADD,
                                   inherit_parent=shp_i, inherit_weight=-1.0)
                 parent_for_arm = shc_i
             if parent_for_arm >= 0:
                 self.bones[ua_i].parent = parent_for_arm
 
-            # 腕捩 inserted between 腕 and ひじ
-            tw_i = self._add(side("腕捩", is_left), (p_ua + p_la) / 2, ua_i, kind="helper")
-            axis = p_la - p_ua
-            n = np.linalg.norm(axis)
-            self.bones[tw_i].flags |= F_AXIS
-            self.bones[tw_i].fixed_axis = axis / n if n > 1e-9 else np.array([0, -1, 0])
-            self.bones[la_i].parent = tw_i
+            self._add_twist_chain(is_left, "腕捩", ua_i, la_i)
 
             if hd_i >= 0:
                 p_hd = self.bones[hd_i].pos
-                wt_i = self._add(side("手捩", is_left), (p_la + p_hd) / 2, la_i, kind="helper")
-                axis2 = p_hd - p_la
-                n2 = np.linalg.norm(axis2)
-                self.bones[wt_i].flags |= F_AXIS
-                self.bones[wt_i].fixed_axis = axis2 / n2 if n2 > 1e-9 else np.array([0, -1, 0])
-                self.bones[hd_i].parent = wt_i
+                self._add_twist_chain(is_left, "手捩", la_i, hd_i)
                 # ダミー: short helper past the wrist, used by hand IK rigs
-                d = p_hd - self.bones[wt_i].pos
+                d = p_hd - p_la
                 dn = np.linalg.norm(d)
                 dummy_pos = p_hd + (d / dn * 0.6 * S / 14.0 if dn > 1e-9 else np.array([0, -1, 0]) * 0.6 * S / 14.0)
                 self._add(side("ダミー", is_left), dummy_pos, hd_i, kind="helper")
+
+    def _add_twist_chain(self, is_left: bool, core: str, root_i: int, end_i: int):
+        """Create a fixed-axis control and three weighted rotation grants."""
+        twist = side(core, is_left)
+        helpers = tuple(twist + str(n) for n in (1, 2, 3))
+        if any(name in self.by_name for name in (twist, *helpers)):
+            self.warnings.append(f"{twist} 存在同名骨骼，跳过自动生成扭转骨，避免覆盖原骨骼")
+            return
+        root, end = self.bones[root_i], self.bones[end_i]
+        direction = end.pos - root.pos
+        length = float(np.linalg.norm(direction))
+        if length <= 1e-9:
+            self.warnings.append(f"{twist} 的关节位置重合，跳过自动生成扭转骨")
+            return
+        control = self._add(twist, root.pos + direction * 0.6, root_i, kind="helper",
+                            flags=F_ROT | F_VISIBLE | F_ENABLED | F_AXIS,
+                            fixed_axis=direction / length)
+        for name, ratio in zip(helpers, (0.25, 0.5, 0.75)):
+            self._add(name, root.pos + direction * ratio, root_i, kind="helper",
+                      flags=F_ROT | F_ENABLED | F_ROT_ADD,
+                      inherit_parent=control, inherit_weight=ratio)
+        self.bones[end_i].parent = control
+        self.twist_chains.append((root.name, end.name, twist, helpers))
 
     # ------------------------------------------------------------------- legs
     def _add_leg_helpers(self, rename):
@@ -472,7 +609,7 @@ class SkeletonBuilder:
             ul_i = self.node_to_bone.get(ul)
             ll_i = self.node_to_bone.get(ll)
             ft_i = self.node_to_bone.get(ft)
-            to_i = self.node_to_bone.get(to) if to is not None else -1
+            to_i = self.node_to_bone.get(to, -1) if to is not None else -1
             if None in (ul_i, ll_i, ft_i):
                 continue
             p_ft = self.bones[ft_i].pos
@@ -506,6 +643,16 @@ class SkeletonBuilder:
                              kind="helper", flags=F_ROT | F_ROT_ADD,
                              inherit_parent=self.by_name["腰"], inherit_weight=-1.0)
             self.bones[ul_i].parent = wc_i
+            leg_names = [side(n, is_left) for n in ("足D", "ひざD", "足首D", "足先EX", "足先EX補助")]
+            if any(name in self.by_name for name in leg_names):
+                self.warnings.append(f"{side('足D', is_left)} 系列存在同名骨骼，跳过生成与权重转移")
+                continue
+            # A parallel D chain reproduces the source only if the joints are
+            # directly connected. Do not silently break nonstandard rigs.
+            if (self.bones[ll_i].parent != ul_i or self.bones[ft_i].parent != ll_i
+                    or (to_i >= 0 and self.bones[to_i].parent != ft_i)):
+                self.warnings.append(f"{side('足D', is_left)} 的源骨骼不是直接相连，跳过生成与权重转移")
+                continue
             # D bones: same parent as 足 (腰キャンセル), inherit rotation from the real leg
             d_ul = self._add(side("足D", is_left), self.bones[ul_i].pos.copy(), wc_i, kind="helper",
                              flags=F_ROT | F_VISIBLE | F_ENABLED | F_ROT_ADD, layer=1,
@@ -517,7 +664,20 @@ class SkeletonBuilder:
                              flags=F_ROT | F_VISIBLE | F_ENABLED | F_ROT_ADD, layer=1,
                              inherit_parent=ft_i, inherit_weight=1.0)
             ex_pos = p_ft + (p_to - p_ft) * (2.0 / 3.0)
-            self._add(side("足先EX", is_left), ex_pos, d_ft, kind="helper", layer=1)
+            ex_i = self._add(side("足先EX", is_left), ex_pos, d_ft, kind="helper", layer=1)
+            toe_name = ""
+            toe_helper = ""
+            if to_i >= 0:
+                # Preserve source toe rotation at its original pivot while EX
+                # remains an independently animatable parent of the toe mesh.
+                toe_name = self.bones[to_i].name
+                toe_helper = side("足先EX補助", is_left)
+                self._add(toe_helper, p_to.copy(), ex_i, kind="helper", layer=1,
+                          flags=F_ROT | F_ENABLED | F_ROT_ADD,
+                          inherit_parent=to_i, inherit_weight=1.0)
+            self.leg_weight_chains.append((self.bones[ul_i].name, self.bones[ll_i].name,
+                                           self.bones[ft_i].name, toe_name,
+                                           *leg_names[:4], toe_helper))
 
     # ------------------------------------------------------------------- eyes
     def _add_eyes(self, rename, head_pos):
@@ -531,6 +691,9 @@ class SkeletonBuilder:
         mid = (self.bones[self.node_to_bone[le]].pos + self.bones[self.node_to_bone[re_]].pos) / 2
         head_i = self.node_to_bone.get(v.humanoid.get("head", -1), -1)
         parent = head_i if head_i >= 0 else self.by_name["全ての親"]
+        head_top = self._head_top(v.humanoid.get("head"))
+        margin = max(abs(float(mid[1] - head_pos[1])) * 0.4, self.scale * 0.04)
+        mid[1] = max(float(mid[1]), head_top) + margin
         # kind "std" sorts 両目 ahead of the eyes, which inherit its rotation
         # (MMD evaluates 付与 in index order)
         both = self._add("両目", mid, parent, kind="std")
@@ -539,6 +702,32 @@ class SkeletonBuilder:
             eye.flags |= F_ROT_ADD
             eye.inherit_parent = both
             eye.inherit_weight = 1.0
+
+    def _head_top(self, head_node):
+        """Estimate the top from vertices attached to the head and descendants.
+
+        A high percentile avoids a stray vertex putting the control far away.
+        If geometry is absent, fall back to the head bone height.
+        """
+        v = self.vrm
+        if head_node is None or head_node not in self.node_to_bone:
+            return 0.0
+        seen, stack = set(), [head_node]
+        while stack:
+            node = stack.pop()
+            if node in seen or not 0 <= node < len(v.nodes):
+                continue
+            seen.add(node)
+            stack.extend(v.nodes[node].get("children", []))
+        heights = []
+        for mesh in v.meshes:
+            head_weight = (np.isin(mesh.joints, list(seen)) * mesh.weights).sum(axis=1)
+            y = mesh.positions[head_weight > 0.5, 1] * self.scale
+            if len(y):
+                heights.append(y[np.isfinite(y)])
+        heights = [y for y in heights if len(y)]
+        return (float(np.quantile(np.concatenate(heights), 0.999)) if heights
+                else float(self.bones[self.node_to_bone[head_node]].pos[1]))
 
     # --------------------------------------------------------------- shoulders
     def _add_shoulder_helpers(self, rename):
@@ -632,4 +821,122 @@ class SkeletonBuilder:
 
     # ------------------------------------------------------------------ output
     def to_pmx_bones(self) -> list[PMXBone]:
-        return [b.to_pmx() for b in self.bones]
+        result = [b.to_pmx() for b in self.bones]
+
+        # The ankle and its IK control share a pivot. Give the IK display tail
+        # a distinct backward direction, following the reference model, so the
+        # corresponding adjustment controls do not lie exactly on top of each
+        # other. This changes display geometry only, not IK links or pivots.
+        for left in (True, False):
+            ik_i = self.by_name.get(side("足ＩＫ", left))
+            toe_i = self.by_name.get(side("つま先ＩＫ", left))
+            if ik_i is None or not result[ik_i].flags & F_IK:
+                continue
+            ik = result[ik_i]
+            back = ik.position - result[toe_i].position if toe_i is not None else np.zeros(3)
+            back = np.array([back[0], 0., back[2]])
+            length = float(np.linalg.norm(back))
+            if length < 1e-8:
+                back = np.array([0., 0., abs(self.scale) * 0.04])
+            else:
+                # A missing VRM toe may use a distant synthetic IK target;
+                # keep its display handle proportional to the model.
+                back *= min(0.7, abs(self.scale) * 0.15 / length)
+            ik.flags &= ~F_TAIL_INDEX
+            ik.tail_offset = back
+
+        # Match the reference D controls: the thigh and knee have an absent
+        # tail-bone index, and the ankle has a zero offset. MMD keeps these as
+        # compact controls; Blender's MMD importer displays zero-length bones
+        # pointing up. Only alter exported display metadata, not the build-time
+        # tails used by physics or the ordinary leg/ankle bones.
+        for chain in self.leg_weight_chains:
+            for name in chain[4:6]:
+                bone = result[self.by_name[name]]
+                bone.flags |= F_TAIL_INDEX
+                bone.tail_bone = -1
+            ankle = result[self.by_name[chain[6]]]
+            ankle.flags &= ~F_TAIL_INDEX
+            ankle.tail_offset = np.zeros(3)
+
+        # VRM joints don't carry Blender's display length. For a non-humanoid
+        # head child that fans out into several chains, a particular child is
+        # not a meaningful tail. Use the source node's local Y direction and a
+        # short scale-relative display vector instead. Keep BoneBuild untouched:
+        # physics derives some body offsets from its original tail data.
+        if self.vrm is None:
+            self._sync_adjustment_display(result)
+            return result
+        head_node = self.vrm.humanoid.get("head")
+        head_index = self.node_to_bone.get(head_node, -1)
+        humanoid_nodes = set(self.vrm.humanoid.values())
+        child_counts = [0] * len(self.bones)
+        for b in self.bones:
+            if 0 <= b.parent < len(self.bones) and np.linalg.norm(b.pos - self.bones[b.parent].pos) > 1e-4:
+                child_counts[b.parent] += 1
+        for i, b in enumerate(self.bones):
+            node = b.source_node
+            if (head_index < 0 or b.parent != head_index or node < 0 or node in humanoid_nodes
+                    or child_counts[i] < 3 or b.flags & (F_TAIL_INDEX | F_IK | F_AXIS)):
+                continue
+            axis = np.asarray(self.vrm.world[node][:3, 1], dtype=np.float64)
+            length = float(np.linalg.norm(axis))
+            if np.isfinite(length) and length > 1e-9:
+                result[i].tail_offset = axis / length * (0.05 * self.scale)
+        self._sync_adjustment_display(result)
+        return result
+
+    def _sync_adjustment_display(self, bones: list[PMXBone]):
+        """Copy final source geometry and axes after all export-only changes.
+
+        Keep an indexed tail when its translated adjustment target exists;
+        otherwise use the equivalent offset, so it never points back at the
+        unshifted original rig. Inheritance and control flags remain independent.
+        """
+        copies = {self.by_name[src]: self.by_name[dst] for src, dst in self.adjustment_pairs}
+        auto_arm_names = {side(n, left) for left in (True, False)
+                          for n in ("肩", "腕", "腕捩", "ひじ", "手捩", "手首")}
+        for source_i, control_i in copies.items():
+            source, control = bones[source_i], bones[control_i]
+            control.position = source.position + self.adjustment_offset
+            control.flags = (control.flags & ~(F_AXIS | F_LOCAL_AXIS)) | (source.flags & (F_AXIS | F_LOCAL_AXIS))
+            control.fixed_axis = source.fixed_axis.copy()
+            control.local_axis_x = source.local_axis_x.copy()
+            control.local_axis_z = source.local_axis_z.copy()
+            if source.flags & F_TAIL_INDEX:
+                target_i = source.tail_bone
+                if target_i < 0:
+                    control.flags |= F_TAIL_INDEX
+                    control.tail_bone = -1
+                elif target_i in copies:
+                    control.flags |= F_TAIL_INDEX
+                    control.tail_bone = copies[target_i]
+                else:
+                    control.flags &= ~F_TAIL_INDEX
+                    control.tail_offset = bones[target_i].position - source.position
+            else:
+                control.flags &= ~F_TAIL_INDEX
+                control.tail_offset = source.tail_offset.copy()
+
+            # Blender's MMD importer assigns an automatic roll to standard arm
+            # names but not to their 調整 counterparts. Describe the equivalent
+            # axes from this bone's actual direction so both import identically.
+            # An explicit source axis always takes precedence.
+            if source.name in auto_arm_names and not source.flags & F_LOCAL_AXIS:
+                if source.flags & F_TAIL_INDEX:
+                    direction = (bones[source.tail_bone].position - source.position
+                                 if source.tail_bone >= 0 else np.zeros(3))
+                else:
+                    direction = source.tail_offset.copy()
+                if np.linalg.norm(direction) < 1e-8:
+                    direction = source.fixed_axis.copy() if source.flags & F_AXIS else np.array([0., 1., 0.])
+                length = float(np.linalg.norm(direction))
+                horizontal = float(np.linalg.norm(direction[:2]))
+                if length > 1e-8 and horizontal > 1e-8:
+                    along = direction / length
+                    perpendicular = np.array([-direction[1], direction[0], 0.]) / horizontal
+                    normal = -np.cross(along, perpendicular)
+                    normal /= np.linalg.norm(normal)
+                    control.flags |= F_LOCAL_AXIS
+                    control.local_axis_x = along
+                    control.local_axis_z = normal

@@ -58,7 +58,7 @@ FINAL_MIN_BODY_MASS = 0.005
 UNIVERSAL_SPRING_GAIN = 50.0
 UNIVERSAL_MAX_K = 200.0
 
-# Universal v6 (see _apply_universal_v6). Derived with an
+# Universal v6 (see _apply_universal_v6). Derived with offline benchmark, an
 # offline Bullet harness that reproduces the v5 30 FPS flicker and the final
 # preset's single-chain twitch, and compares every body against a VRM
 # SpringBone reference running the same motion.
@@ -84,7 +84,8 @@ V6_SOFT_OMEGA_DT_MAX = 0.6    # soft mode: omega*dt cap at 30 FPS (flicker from 
 V6_SOFT_LIMIT_DEG = 45.0      # soft mode: rotation limit (safety net only)
 V6_REF_FPS = 30.0
 
-# Universal v7 (default "universal").  From two MMD 9.26 calibration rounds:
+# Universal v7 (default "universal").  From two MMD 9.26 calibration rounds
+# (offline calibration, calibration notes):
 #  * MMD physics runs on a fixed internal step, independent of the output
 #    frame rate; damping < 1 is unusable (chains get pinned at their limits).
 #  * At damping 1 a joint spring moves the joint by K*dt^2/I per step, where I
@@ -104,7 +105,7 @@ V7_MMD_DT = 1.0 / 60.0
 # reference (vrm2pmx/spring_ref.py).  In a locked chain the visible sway is the
 # solver lag, which grows with segment count and length and shrinks with body
 # radius and with the root->tip mass ratio.  Fitted on 140 chains x 5 ratios
-# (two test models; MMD-calibrated harness), rms error 0.26 in log:
+# (model A, model B; MMD-calibrated harness), rms error 0.26 in log:
 #   log sway = c0 + c1 lr + c2 n + c3 log r + c4 log L + c5 lr n
 #   (lr = log mass ratio, n = segments, r = body radius, L = chain length)
 V8_SWAY_FIT = [-6.1793, -0.3228, 0.309, -2.0816, 2.5306, -0.1416]
@@ -112,11 +113,11 @@ V8_TARGET_SCALE = 1.0         # harness sway per unit of VRM sway, with bodies o
                               # (mid placement: 1.15 too soft, 0.85 / 0.65 still returned too slowly in MMD)
 V8_RATIO_RANGE = (1.3, 4.0)   # tip never heavier than root; >= 1.3 so long chains return in reasonable time
 V8_PLACEMENT = "joint"        # locked multi-body chains: bodies on their joints ("joint", like final)
-                              # or half-way along the bone ("mid").  MMD real-tail
+                              # or half-way along the bone ("mid", v7/v8 up to a63042c).  MMD real-tail
                               # tests: mid placement + thick bodies flickers more (rows couple)
 # Locked chains with bodies on their joints sway much less, and the sway falls
 # off with the mass ratio roughly linearly in log, faster for more segments.
-# Fitted on 110 chains x 5 ratios from two models, rms error 0.38 in log:
+# Fitted on 110 chains x 5 ratios (model A, model B), rms error 0.38 in log:
 #   log sway = c0 + c1 (ratio-1) n + c2 n + c3 log r + c4 log L
 V8_SWAY_FIT_JOINT = [-9.1494, -0.2591, 0.7302, -2.5959, 2.7136]
 V8_FORCE_RATIO = None         # diagnostics / fitting: use this mass ratio for every locked chain
@@ -132,7 +133,7 @@ V10_SOFT_REF_RADIUS = 0.4     # locked thick-short chains sway ~0.6 at this radi
 V10_SOFT_REF_SWAY = 0.6
 V10_SOFT_RADIUS_EXP = 1.75
 V8_SOFT_ROOT_ONLY = True      # soft chains: only the root joint swings, the rest stays locked
-                              # (every joint at its limit made one model's ears twitch in MMD)
+                              # (every joint at its limit made the model A ears twitch in MMD)
 V8_SOFT_LIMIT_DEG = 8.0       # chains that cannot reach their sway locked (thick and short, e.g. ears)
 # v11: the tail "twitches" were not solver noise but a Bullet 6DOF corner case.
 # A locked axis (lower == upper limit) is a bilateral row only while the
@@ -142,45 +143,45 @@ V8_SOFT_LIMIT_DEG = 8.0       # chains that cannot reach their sway locked (thic
 # the time in single precision (a joint whose two bodies have the same
 # orientation gives an exact 0), and in a bent chain the freed joint snaps open
 # by up to ~12 deg in one substep - the visible twitch.  Instrumented harness
-# every tail kink lined up with such a step.
+# (offline simulator ROWLOG): every tail kink lined up with such a step.
 # Locking at a tiny non-zero value keeps the row active (lower == upper is
 # still the bilateral case); smaller is better because an exact hit on the
 # value itself gets rarer: 1e-7 -> 437 free axis-steps, 1e-9 -> 27, 1e-12 -> 0
-# (one test model, 12 s).  Sway is unchanged.
+# (model A, 12 s).  Sway is unchanged.
 V11_LOCK_EPS = 1e-12
 # v12: hardness per body region, from the user's check of the v11 MMD renders
-# hair 2x harder, ears 1.5x harder, tail fine, single-bone strands
+# (f920eb4): hair 2x harder, ears 1.5x harder, tail fine, single-bone strands
 # too floaty and flickering.  "x harder" = the chain's sway divided by x.
 # Harness sweep of the per-segment mass ratio q (bodies on joints, locked):
-# for 3-4 segment chains sway ~ q^-1.1 (two models: 1.0-1.3 and 0.9-1.2), so a
+# for 3-4 segment chains sway ~ q^-1.1 (model A 1.0-1.3, model B 0.9-1.2), so a
 # hardness H multiplies q by H^(1/1.1).  Whiskers already sit at q = 4, hence
 # the higher cap for these chains.
 V12_HEAD_HARDNESS = 2.0       # multi-segment chains hanging from the head (hair, whiskers)
 V12_RATIO_EXP = 1.1
 V12_HEAD_RATIO_MAX = 8.0
-# Thick short chains (ears, "soft" above): sway ~ radius^-1.4 to ^-1.75
-# across two test models around the v10 radius; 1.55 splits the difference.
+# Thick short chains (ears, "soft" above): sway ~ radius^-1.4 (model A) to ^-1.75
+# (model B) around the v10 radius; 1.55 splits the difference.
 V12_SOFT_HARDNESS = 1.5
 V12_SOFT_RADIUS_EXP = 1.55
 # Single-bone chains (root = tip): the clean v7 spring still swung 4x the VRM
 # sway and flickered (high-frequency share ~12 % of the sway); +-10 deg limits
 # halved the sway but doubled the flicker.  Locked like every other chain they
 # keep ~0.17x the VRM sway, like the 2-segment chains, and stop flickering.
-V12_LOCK_SINGLES = False      # v12: locked looked completely static in MMD
-# v13: single-bone chains swing again, without the flicker.  Harness (one model,
+V12_LOCK_SINGLES = False      # v12 (2f93aba): locked looked completely static in MMD
+# v13: single-bone chains swing again, without the flicker.  Harness (model B,
 # 27 strands; angle of the strand vs its rest, 30 fps): the v7 spring swung
 # 33 deg on average with 53-58 back-and-forth frames, almost all from hitting
 # the +-30 deg limits (no limit: ~10, like the multi-bone hair tips).  With a
 # wide limit that is never reached, a stiffer spring and a larger physics
 # sphere (these bodies do not collide, the radius only sets the inertia):
 # 13-15 deg on average, 8-9 back-and-forth frames, high-frequency part 1.1 deg
-# instead of 2.6 (similar in the second model).
+# instead of 2.6 (model A the same).
 V13_SINGLE_GAIN = 0.2
 V13_SINGLE_RADIUS_SCALE = 3.0
 V13_SINGLE_LIMIT_DEG = 80.0
-# v14: under a real dance (first quarter, head turning up to ~400 deg/s)
-# the v13 strands still flickered: 88 / 55
-# out-and-back jumps > 3 deg (two models, median per strand; final's +-20 deg
+# v14: under a real dance (CH4NGE_Light.vmd, first quarter, head turning up to
+# ~400 deg/s; offline motion evaluation) the v13 strands still flickered: 88 / 55
+# out-and-back jumps > 3 deg (model B / model A, median per strand; final's +-20 deg
 # springs: 268 / 274; multi-bone hair tips 98 / 90).  A larger sphere smooths
 # the drag far more than a stiffer spring, and a softer spring gives the swing
 # back: radius x6 with gain 0.08 swings like v13 in physturn (mean 14.9 / 14.4
@@ -196,8 +197,8 @@ SINGLE_CHAIN_MIN_MASS = 0.5
 SPRING_BASE = 500.0             # joint spring constant per unit inertia
 ROT_LIMIT = np.radians(45.0)
 
-# Angular damping per chain depth, measured from a reference PMX.
-# Values approach 1.0 near the root.
+# Angular damping per chain depth, read straight out of the shipped
+# a converted model (VRM2PMX output). Values approach 1.0 near the root.
 ANG_DAMP_TABLE = [1.0, 0.92, 0.856, 0.8048, 0.7638, 0.7311]
 
 
@@ -470,7 +471,8 @@ class PhysicsBuilder:
 
             if self.preset.startswith(("vrm2pmx", "smooth", "fixed", "zero")):
                 # Port of lispcoc/VRM2PMX-Unity (PMXExporter.cs, Rigid region),
-                # with the mass/damping gradients matched to a reference PMX:
+                # with the mass/damping gradients matched to the shipped
+                # a converted model:
                 #   mass  0.05 * 0.3^depth
                 #   linear damping 0.9^depth
                 #   angular damping follows the measured table
@@ -1615,7 +1617,8 @@ class PhysicsBuilder:
                     self.bodies[b].position = np.asarray(incoming[b].position, dtype=np.float64).copy()
                 moved += 1
         # v11: bodies moved onto their joints / shrunk above can start inside a
-        # body collider. Apply v7's rule again to the final placement:
+        # body collider (model A tail segment 2 in spine_2 by 0.6, model B tail root
+        # in chest_0 by 0.4).  Apply v7's rule again to the final placement:
         # a body that starts inside a collider does not collide.  Only ever
         # switches collisions off, so chains v7 already excluded stay excluded.
         inside = 0

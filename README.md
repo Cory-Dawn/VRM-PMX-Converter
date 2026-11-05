@@ -7,6 +7,7 @@
 ## 主要特点
 
 - **自动生成常用 MMD 骨骼**：转换时建立标准骨骼及常用辅助骨骼，减少手动追加骨骼的工作。
+- **可选动作调整骨**：为手臂、躯干、腿部和足部等生成独立调整控制，支持自定义位置，方便对已有动作手动打关键帧修正穿模。
 - **优化物理表现**：根据 VRM 弹簧骨参数生成物理，针对 MMD 中的抖动进行优化，尽量减少后续调整。
 - **整理表情面板**：根据表情名称自动分类；无法识别的名称会归入“其他”。
 - **支持材质表情**：可将部分材质颜色、透明度变化转换为 PMX 材质表情，包括以透明度控制部件显示的开关。
@@ -28,11 +29,11 @@
 
 </details>
 
-界面截图中的模型名称和作者为演示数据。
+界面截图中的模型名称和作者为演示数据，画面为旧版界面示意，实际设置以当前版本为准。
 
 ## 下载和使用
 
-在本仓库的 Releases 页面下载最新的 `VRM2PMX_v1.4.2_release.zip`，解压后双击 `VRM2PMX.exe`。选择 VRM 模型、输出位置和转换选项后，点击“开始转换”。详细操作见 [使用说明](使用说明.md)。
+在本仓库的 Releases 页面下载 `VRM2PMX_v1.5.0_release.zip`，解压后双击 `VRM2PMX.exe`。选择 VRM 模型、输出位置和转换选项后，点击“开始转换”。详细操作见 [使用说明](使用说明.md)。
 
 转换涉及骨骼、表情、材质、贴图和物理。不同模型的效果可能不同，请在 MMD 或 PMX Editor 中检查结果，并遵守模型作者的使用条款。
 
@@ -61,7 +62,7 @@ py -3.13 -m PyInstaller --noconfirm --clean VRM2PMX.spec
 py -3.13 -m PyInstaller --noconfirm --clean VRM2PMX-CLI.spec
 ```
 
-生成的程序位于 `dist/`。v1.4.2 发布包使用 Python 3.13.17、NumPy 2.5.4、Pillow 13.0.0、pypinyin 0.55.0、tkinterdnd2 0.7.0 和 PyInstaller 6.22.3 构建。
+生成的程序位于 `dist/`。v1.5.0 发布包使用 Python 3.13.17、NumPy 2.5.4、Pillow 13.0.0、pypinyin 0.55.0、tkinterdnd2 0.7.0 和 PyInstaller 6.22.3 构建。
 
 图标原始文件为 `assets/VRM2PMX.svg`，可运行 `py -3.13 dev/make_icon.py` 重新生成 PNG 和 ICO。
 
@@ -71,7 +72,7 @@ Copyright (c) 2026 CoryDawn。项目代码采用 [GNU GPL v3.0](LICENSE)（GPL-3
 
 ## 第三方许可
 
-部分物理实现移植自 [UniVRM](https://github.com/vrm-c/UniVRM) 和 [PMXExporter](https://github.com/lispcoc/VRM2PMX-Unity/tree/master/Assets/PMXExporter)，原作者的许可声明见 `LICENSES/`。其他组件及发布包的许可信息见 [第三方声明](THIRD_PARTY_NOTICES.md)。
+部分物理实现移植自 [UniVRM](https://github.com/vrm-c/UniVRM) 和 [PMXExporter](https://github.com/lispcoc/VRM2PMX-Unity/tree/master/Assets/PMXExporter)；调整骨局部轴处理参考了 [MMD Tools](https://github.com/MMD-Blender/blender_mmd_tools)。相关许可声明见 `LICENSES/`，其他组件及发布包的许可信息见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
 ## 支持作者
 

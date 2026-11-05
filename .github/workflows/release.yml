@@ -1,0 +1,77 @@
+name: Windows release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.17"
+      - name: Install release dependencies
+        run: >-
+          python -m pip install -r requirements.txt
+          numpy==2.5.4 Pillow==13.0.0 pypinyin==0.55.0 tkinterdnd2==0.7.0
+          pyinstaller==6.22.3 pyinstaller-hooks-contrib==2026.9
+          setuptools==84.2.1 packaging==26.3 altgraph==0.17.5
+          pefile==2024.8.26 pywin32-ctypes==0.2.3 pytest==9.2.0
+      - name: Check version
+        id: version
+        run: |
+          VERSION=$(python main.py --version)
+          if [[ "v$VERSION" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag and application version differ"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Run tests
+        run: |
+          PYROOT=$(python -c "import sys; print(sys.base_prefix)")
+          export TCL_LIBRARY=$(ls -d "$PYROOT"/tcl/tcl8* | head -1)
+          export TK_LIBRARY=$(ls -d "$PYROOT"/tcl/tk8* | head -1)
+          python -m pytest -q dev/tests || python -m pytest -q --last-failed dev/tests
+      - name: Build executables
+        run: |
+          python -m PyInstaller --noconfirm --clean VRM2PMX.spec
+          python -m PyInstaller --noconfirm --clean VRM2PMX-CLI.spec
+      - name: Check executables
+        run: |
+          powershell -NoProfile -Command '$p = Start-Process dist\VRM2PMX.exe -ArgumentList "--smoke-test" -Wait -PassThru; exit $p.ExitCode'
+          ./dist/VRM2PMX-CLI.exe --help
+      - name: Package with license notices
+        id: package
+        run: |
+          NAME="VRM2PMX_v${{ steps.version.outputs.version }}_release"
+          mkdir -p "$NAME"
+          cp dist/VRM2PMX.exe dist/VRM2PMX-CLI.exe 使用说明.md LICENSE THIRD_PARTY_NOTICES.md "$NAME/"
+          cp -r LICENSES third-party-licenses "$NAME/"
+          powershell -NoProfile -Command "Compress-Archive -Path '$NAME\*' -DestinationPath '$NAME.zip' -Force"
+          python -c "import sys,zipfile; n=set(zipfile.ZipFile(sys.argv[1]).namelist()); required={'VRM2PMX.exe','VRM2PMX-CLI.exe','LICENSE','THIRD_PARTY_NOTICES.md','LICENSES/MMDTools.txt'}; assert required <= n, required-n; assert any(x.startswith('third-party-licenses/') for x in n); assert not any(x.lower().endswith(('.vrm','.pmx')) or x.rsplit('/',1)[-1] in ('AGENTS.md','CLAUDE.md','AGENT_HANDOVER.md','settings.json') for x in n); print('Release archive contents verified')" "$NAME.zip"
+          sha256sum "$NAME.zip" | tee "$NAME.zip.sha256"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.name }}.zip
+            ${{ steps.package.outputs.name }}.zip.sha256
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: VRM → PMX 转换器 v${{ steps.version.outputs.version }}
+          body_path: docs/release_notes/v${{ steps.version.outputs.version }}.md
+          prerelease: false
+          make_latest: true
+          files: |
+            ${{ steps.package.outputs.name }}.zip
+            ${{ steps.package.outputs.name }}.zip.sha256
