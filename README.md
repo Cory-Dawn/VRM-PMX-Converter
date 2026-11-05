@@ -49,4 +49,4 @@ Copyright (c) 2026 CoryDawn。项目代码采用 [GNU GPL v3.0](LICENSE)（GPL-3
 
 软件可免费使用，赞助完全自愿。如果这个软件帮到了你，请作者喝杯咖啡吧！
 
-爱发电链接：待补充。
+[前往爱发电支持作者](https://afdian.com/a/CoryDawn)
