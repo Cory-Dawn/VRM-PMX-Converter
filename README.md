@@ -2,6 +2,8 @@
 
 # VRM → PMX 转换器
 
+**简体中文** | [English](README.en.md) | [日本語](README.ja.md)
+
 一款免费开源的 Windows 工具，将 UniVRM 输出的 VRM 0.x 角色模型转换为 MikuMikuDance 可使用的 PMX 模型。
 
 ## 主要特点
@@ -14,7 +16,7 @@
 - **复用贴图**：多个材质引用同一贴图时复用输出文件，避免重复导出该引用。
 - **继承材质设置**：根据 VRM 材质设置生成描边，并继承双面显示设置。
 - **可选名称转换**：将材质和表情名中的部分中文转换为日文常用字形，缓解 MMD 或 PMX Editor 中的乱码。
-- **轻量易用**：支持拖放与批量添加，提供浅色和深色界面。Windows 发布包约 66 MB，解压后无需安装 Python。
+- **轻量易用**：支持拖放与批量添加，提供浅色和深色界面，并支持简体中文、英语和日语。Windows 发布包约 66 MB，解压后无需安装 Python。
 
 模型结构、材质和动作各不相同，物理、描边及表情效果不能保证在所有模型上完全一致；转换后建议在 MMD 或 PMX Editor 中检查。名称转换会改写名称，可能影响旧动作中对应的表情轨道。
 
@@ -29,11 +31,11 @@
 
 </details>
 
-界面截图中的模型名称和作者为演示数据。
+界面截图中的模型名称和作者为演示数据。顶部可切换简体中文、英语和日语，选择会自动保存；界面语言不会改变模型名称。
 
 ## 下载和使用
 
-在本仓库的 Releases 页面下载 `VRM2PMX_v1.5.0_release.zip`，解压后双击 `VRM2PMX.exe`。选择 VRM 模型、输出位置和转换选项后，点击“开始转换”。详细操作见 [使用说明](使用说明.md)。
+在本仓库的 Releases 页面下载 `VRM2PMX_v1.5.1_release.zip`，解压后双击 `VRM2PMX.exe`。选择 VRM 模型、输出位置和转换选项后，点击“开始转换”。详细操作见 [使用说明](使用说明.md)。
 
 转换涉及骨骼、表情、材质、贴图和物理。不同模型的效果可能不同，请在 MMD 或 PMX Editor 中检查结果，并遵守模型作者的使用条款。
 
@@ -62,7 +64,7 @@ py -3.13 -m PyInstaller --noconfirm --clean VRM2PMX.spec
 py -3.13 -m PyInstaller --noconfirm --clean VRM2PMX-CLI.spec
 ```
 
-生成的程序位于 `dist/`。v1.5.0 发布包使用 Python 3.13.17、NumPy 2.5.4、Pillow 13.0.0、pypinyin 0.55.0、tkinterdnd2 0.7.0 和 PyInstaller 6.22.3 构建。
+生成的程序位于 `dist/`。v1.5.1 发布包使用 Python 3.13.17、NumPy 2.5.4、Pillow 13.0.0、pypinyin 0.55.0、tkinterdnd2 0.7.0 和 PyInstaller 6.22.3 构建。
 
 图标原始文件为 `assets/VRM2PMX.svg`，可运行 `py -3.13 dev/make_icon.py` 重新生成 PNG 和 ICO。
 

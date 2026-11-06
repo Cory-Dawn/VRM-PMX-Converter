@@ -356,7 +356,7 @@ class Segmented(tk.Canvas):
         if not self.winfo_exists():
             return
         self.delete("all")
-        w = self.winfo_width() if self.winfo_width() > 1 else int(float(self.cget("width") or 60))
+        w = self.winfo_width() if self.winfo_width() > 1 else self.winfo_pixels(self.cget("width") or 60)
         h = self.h
         _smooth_rect(self, 0, 0, w, h, 8, fill=SEG_BG)
         seg = w / len(self.options)
